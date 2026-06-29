@@ -43,34 +43,67 @@ function escapeHtml(value) {
   })[char]);
 }
 
-function formatResult(payload, from) {
+function formatSummary(payload, from) {
   const status = payload.passed ? "ПРОШЕЛ" : "НЕ ПРОШЕЛ";
   const mistakes = (payload.answers || []).filter((answer) => !answer.isCorrect);
   const student = userLabel(from || normalizePayloadUser(payload.user));
 
   const lines = [
-    `<b>Сертификация ДРНК: ${status}</b>`,
+    `<b>Сертификация ДРНК</b>`,
+    `<b>Статус:</b> ${status}`,
     "",
-    `<b>Студент:</b> ${escapeHtml(student)}`,
-    `<b>Результат:</b> ${payload.score}/${payload.total}`,
-    `<b>Проходной балл:</b> ${payload.passScore}`,
-    `<b>Ошибок:</b> ${mistakes.length}`,
-    `<b>Дата:</b> ${new Date(payload.finishedAt || Date.now()).toLocaleString("ru-RU")}`
+    `<b>Студент</b>`,
+    `${escapeHtml(student)}`,
+    "",
+    `<b>Итог</b>`,
+    `Результат: ${payload.score}/${payload.total}`,
+    `Проходной балл: ${payload.passScore}`,
+    `Ошибок: ${mistakes.length}`,
+    `Дата: ${new Date(payload.finishedAt || Date.now()).toLocaleString("ru-RU")}`
   ];
 
+  return lines.join("\n");
+}
+
+function formatMistake(answer, index, total) {
+  return [
+    `<b>Ошибка ${index + 1} из ${total}</b>`,
+    "",
+    `<b>Вопрос ${answer.number}</b>`,
+    escapeHtml(answer.question),
+    "",
+    `<b>Ответ студента:</b>`,
+    escapeHtml(answer.selectedAnswer || "не выбран"),
+    "",
+    `<b>Правильный ответ:</b>`,
+    escapeHtml(answer.correctAnswer)
+  ].join("\n");
+}
+
+function formatMistakeMessages(payload) {
+  const mistakes = (payload.answers || []).filter((answer) => !answer.isCorrect);
+  const messages = [];
+
   if (mistakes.length) {
-    lines.push("", "<b>Ошибки:</b>");
-    mistakes.forEach((answer) => {
-      lines.push(
-        "",
-        `<b>${answer.number}. ${escapeHtml(answer.question)}</b>`,
-        `Ответ студента: ${escapeHtml(answer.selectedAnswer || "не выбран")}`,
-        `Правильно: ${escapeHtml(answer.correctAnswer)}`
-      );
+    let current = "<b>Разбор ошибок</b>";
+
+    mistakes.forEach((answer, index) => {
+      const block = formatMistake(answer, index, mistakes.length);
+      const next = `${current}\n\n${block}`;
+
+      if (next.length > 3500) {
+        messages.push(current);
+        current = block;
+        return;
+      }
+
+      current = next;
     });
+
+    messages.push(current);
   }
 
-  return lines.join("\\n");
+  return messages;
 }
 
 function normalizePayloadUser(user = {}) {
@@ -90,7 +123,11 @@ async function sendResult(payload, from, replyChatId) {
     throw new Error("ADMIN_CHAT_ID is required for direct result sending");
   }
 
-  await sendLongMessage(adminChatId, formatResult(payload, from));
+  await sendLongMessage(adminChatId, formatSummary(payload, from));
+
+  for (const message of formatMistakeMessages(payload)) {
+    await sendLongMessage(adminChatId, message);
+  }
 
   if (replyChatId && String(adminChatId) !== String(replyChatId)) {
     await telegram("sendMessage", {
