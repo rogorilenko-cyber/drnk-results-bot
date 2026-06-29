@@ -1,5 +1,6 @@
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
+const PORT = Number(process.env.PORT || 3000);
 
 if (!BOT_TOKEN) {
   throw new Error("BOT_TOKEN is required");
@@ -45,7 +46,7 @@ function escapeHtml(value) {
 function formatResult(payload, from) {
   const status = payload.passed ? "ПРОШЕЛ" : "НЕ ПРОШЕЛ";
   const mistakes = (payload.answers || []).filter((answer) => !answer.isCorrect);
-  const student = userLabel(from);
+  const student = userLabel(from || normalizePayloadUser(payload.user));
 
   const lines = [
     `<b>Сертификация ДРНК: ${status}</b>`,
@@ -70,6 +71,35 @@ function formatResult(payload, from) {
   }
 
   return lines.join("\\n");
+}
+
+function normalizePayloadUser(user = {}) {
+  return {
+    id: user.id,
+    username: user.username,
+    first_name: user.first_name || user.firstName,
+    last_name: user.last_name || user.lastName
+  };
+}
+
+async function sendResult(payload, from, replyChatId) {
+  if (payload.type !== "drnk_certification_result") return false;
+
+  const adminChatId = ADMIN_CHAT_ID || replyChatId;
+  if (!adminChatId) {
+    throw new Error("ADMIN_CHAT_ID is required for direct result sending");
+  }
+
+  await sendLongMessage(adminChatId, formatResult(payload, from));
+
+  if (replyChatId && String(adminChatId) !== String(replyChatId)) {
+    await telegram("sendMessage", {
+      chat_id: replyChatId,
+      text: "Результат сертификации отправлен."
+    });
+  }
+
+  return true;
 }
 
 async function sendLongMessage(chatId, text) {
@@ -110,20 +140,75 @@ async function handleUpdate(update) {
     return;
   }
 
-  if (payload.type !== "drnk_certification_result") return;
+  await sendResult(payload, message.from, message.chat.id);
+}
 
-  const adminChatId = ADMIN_CHAT_ID || message.chat.id;
-  await sendLongMessage(adminChatId, formatResult(payload, message.from));
-
-  if (adminChatId !== String(message.chat.id)) {
-    await telegram("sendMessage", {
-      chat_id: message.chat.id,
-      text: "Результат сертификации отправлен."
+function readRequestBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1_000_000) {
+        reject(new Error("Request body is too large"));
+        request.destroy();
+      }
     });
+    request.on("end", () => resolve(body));
+    request.on("error", reject);
+  });
+}
+
+function sendJson(response, statusCode, payload) {
+  response.writeHead(statusCode, {
+    "content-type": "application/json; charset=utf-8",
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "POST, OPTIONS",
+    "access-control-allow-headers": "content-type"
+  });
+  response.end(JSON.stringify(payload));
+}
+
+async function handleHttpRequest(request, response) {
+  if (request.method === "OPTIONS") {
+    sendJson(response, 204, {});
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/") {
+    sendJson(response, 200, { ok: true, service: "drnk-results-bot" });
+    return;
+  }
+
+  if (request.method !== "POST" || request.url !== "/result") {
+    sendJson(response, 404, { ok: false, error: "Not found" });
+    return;
+  }
+
+  try {
+    const payload = JSON.parse(await readRequestBody(request));
+    const accepted = await sendResult(payload, normalizePayloadUser(payload.user));
+    sendJson(response, accepted ? 200 : 400, { ok: accepted });
+  } catch (error) {
+    console.error(error.message);
+    sendJson(response, 500, { ok: false, error: "Result was not sent" });
   }
 }
 
+async function startHttpServer() {
+  const { createServer } = await import("node:http");
+  createServer((request, response) => {
+    handleHttpRequest(request, response).catch((error) => {
+      console.error(error.message);
+      sendJson(response, 500, { ok: false, error: "Server error" });
+    });
+  }).listen(PORT, () => {
+    console.log(`HTTP result endpoint is listening on port ${PORT}`);
+  });
+}
+
 async function poll() {
+  await telegram("deleteWebhook", { drop_pending_updates: false });
+
   while (true) {
     try {
       const updates = await telegram("getUpdates", {
@@ -144,4 +229,5 @@ async function poll() {
 }
 
 console.log("DRNK certification bot is running");
+startHttpServer();
 poll();
